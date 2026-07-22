@@ -1,0 +1,7 @@
+# RTX PRO 5000 已验证环境使用的核心 GPU 依赖。
+# SGLang 必须按 REPORT.md 从与模型匹配的源码目录单独安装。
+torch==2.11.0
+triton==3.6.0
+sglang-kernel==0.4.2.post2
+flash-attn-4>=4.0.0b9
+nvidia-cutlass-dsl[cu13]==4.5.1
