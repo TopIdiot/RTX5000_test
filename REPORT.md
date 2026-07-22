@@ -12,16 +12,6 @@
 | `requirements.txt` | 调用方核心 Python/GPU 依赖版本 |
 | `REPORT.md` | 覆盖范围、当前结论和复现命令 |
 
-`welmv4_op.py` 与当前模型环境中的源码完全一致。
-
-SHA256：
-
-```text
-2c7290feb988a63ff3303b9a864a98225dd4a08a52e8385c6a4ea342dd31f609
-```
-
-其他算子直接调用 SGLang、PyTorch、Triton、FA3/FA4 和
-sglang-kernel 的开源实现，不再复制复杂的 `kernel_sources`。
 
 ### 调用方环境
 
@@ -101,30 +91,6 @@ benchmark 使用同一源码中的 Triton Attention，并额外探测 FA4。
 - Paged KV cache 和 `ForwardBatch` 调度
 - Logits processor 和 sampling
 
-### Matmul/GEMM 覆盖
-
-模型中的 Matmul 已经测试。脚本使用 `torch.nn.functional.linear` 调用
-PyTorch 当前的 BF16 GEMM 实现，而 Router 使用 `welmv4_op.py` 中的自定义
-Triton matmul。所有普通 GEMM 都测试 `M=1,32,128,512`。
-
-| Case | 实际矩阵 Shape | 实现 |
-| --- | --- | --- |
-| `oe_projection` | `[M,2048] x [2048,2048]` | PyTorch BF16 GEMM |
-| `qkv_imitated_projection` | `[M,2048] x [2048,2560]` | PyTorch BF16 GEMM |
-| `qkv_standard_projection` | `[M,2048] x [2048,2048]` | PyTorch BF16 GEMM |
-| `q_mirror_projection` | `[M,2048] x [2048,1536]` | PyTorch BF16 GEMM |
-| `attention_gate_projection` | `[M,2048] x [2048,6]` | PyTorch BF16 GEMM |
-| `o_projection` | `[M,1536] x [1536,2048]` | PyTorch BF16 GEMM |
-| `router_linear` | `[M,2048] x [2048,512]` | WeLM Triton custom matmul |
-| `shared_gate_up_projection` | `[M,2048] x [2048,1024]` | PyTorch BF16 GEMM |
-| `shared_down_projection` | `[M,512] x [512,2048]` | PyTorch BF16 GEMM |
-| `lm_head` | `[M,2048] x [2048,38912]` | PyTorch BF16 GEMM |
-| `fused_moe` gate/up | 512 组 `[M,2048] x [2048,1024]`，TopK=10 | SGLang Triton MoE |
-| `fused_moe` down | 512 组 `[M,512] x [512,2048]`，TopK=10 | SGLang Triton MoE |
-
-这些 GEMM 同时包含在 H20 精度 dump/RTX validate 和性能 benchmark 中。
-计算密集型 GEMM 使用 268 BF16 TFLOPS 作为峰值对比，而不是用显存带宽
-评价。
 
 ## 4. 精度验证
 
@@ -291,9 +257,7 @@ CUDA_VISIBLE_DEVICES=0 "$PYTHON" \
 - H20 使用 SGLang FA3，可以传入 Attention Sink。
 - RTX PRO 5000 上 SGLang Triton Sink prefill/decode 可以运行。
 - 普通 FA4 可以在 SM120 上运行。
-- 当前 FA4 + Sink 首先遇到 Cutlass DSL `Int32` window 参数接口错误。
-- 即使修复接口，当前 SM120 FA4 forward 也没有实例化 learnable sink 支持。
-- WeLMv4 没有自己的 FA4 Sink custom kernel。
+- 当前 FA4 + Sink 遇到 Cutlass DSL `Int32` window 参数接口错误。
 
 因此当前模型在 RTX PRO 5000 上应使用 Triton Attention Sink，FA4 + Sink
 需要 NVIDIA/FA4 上游继续适配。
