@@ -4,7 +4,7 @@ This file preserves the model implementations used by the standalone benchmark.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import triton
@@ -705,3 +705,162 @@ class WelmV4InplaceRotaryEmbedding(RotaryEmbedding):
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
 
+
+@triton.jit
+def _welm_oe_lookup_concat_prehashed_4x512_kernel(
+    hash0_ptr,
+    hash1_ptr,
+    hash2_ptr,
+    hash3_ptr,
+    weight0_ptr,
+    weight1_ptr,
+    weight2_ptr,
+    weight3_ptr,
+    out_ptr,
+    num_tokens,
+    shard_start_0,
+    shard_start_1,
+    shard_start_2,
+    shard_start_3,
+    shard_end_0,
+    shard_end_1,
+    shard_end_2,
+    shard_end_3,
+    hash0_stride,
+    hash1_stride,
+    hash2_stride,
+    hash3_stride,
+    weight0_row_stride,
+    weight1_row_stride,
+    weight2_row_stride,
+    weight3_row_stride,
+    out_row_stride,
+    BLOCK_D: tl.constexpr,
+    EMBED_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    dim_block_idx = tl.program_id(1)
+    offs_d = dim_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+    token_mask = token_idx < num_tokens
+    dim_mask = offs_d < EMBED_DIM
+
+    bucket0 = tl.load(hash0_ptr + token_idx * hash0_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket1 = tl.load(hash1_ptr + token_idx * hash1_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket2 = tl.load(hash2_ptr + token_idx * hash2_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+    bucket3 = tl.load(hash3_ptr + token_idx * hash3_stride, mask=token_mask, other=0).to(
+        tl.uint32
+    )
+
+    valid0 = token_mask & (bucket0 >= shard_start_0.to(tl.uint32)) & (
+        bucket0 < shard_end_0.to(tl.uint32)
+    )
+    valid1 = token_mask & (bucket1 >= shard_start_1.to(tl.uint32)) & (
+        bucket1 < shard_end_1.to(tl.uint32)
+    )
+    valid2 = token_mask & (bucket2 >= shard_start_2.to(tl.uint32)) & (
+        bucket2 < shard_end_2.to(tl.uint32)
+    )
+    valid3 = token_mask & (bucket3 >= shard_start_3.to(tl.uint32)) & (
+        bucket3 < shard_end_3.to(tl.uint32)
+    )
+
+    row0 = (bucket0 - shard_start_0.to(tl.uint32)).to(tl.int64)
+    row1 = (bucket1 - shard_start_1.to(tl.uint32)).to(tl.int64)
+    row2 = (bucket2 - shard_start_2.to(tl.uint32)).to(tl.int64)
+    row3 = (bucket3 - shard_start_3.to(tl.uint32)).to(tl.int64)
+
+    mask0 = valid0 & dim_mask
+    mask1 = valid1 & dim_mask
+    mask2 = valid2 & dim_mask
+    mask3 = valid3 & dim_mask
+
+    emb0 = tl.load(
+        weight0_ptr + row0 * weight0_row_stride + offs_d, mask=mask0, other=0.0
+    )
+    emb1 = tl.load(
+        weight1_ptr + row1 * weight1_row_stride + offs_d, mask=mask1, other=0.0
+    )
+    emb2 = tl.load(
+        weight2_ptr + row2 * weight2_row_stride + offs_d, mask=mask2, other=0.0
+    )
+    emb3 = tl.load(
+        weight3_ptr + row3 * weight3_row_stride + offs_d, mask=mask3, other=0.0
+    )
+
+    out_token_base = token_idx * out_row_stride
+    tl.store(out_ptr + out_token_base + offs_d, emb0, mask=token_mask & dim_mask)
+    tl.store(
+        out_ptr + out_token_base + EMBED_DIM + offs_d,
+        emb1,
+        mask=token_mask & dim_mask,
+    )
+    tl.store(
+        out_ptr + out_token_base + 2 * EMBED_DIM + offs_d,
+        emb2,
+        mask=token_mask & dim_mask,
+    )
+    tl.store(
+        out_ptr + out_token_base + 3 * EMBED_DIM + offs_d,
+        emb3,
+        mask=token_mask & dim_mask,
+    )
+
+
+def _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
+    *,
+    hashed_inputs: Sequence[torch.Tensor],
+    oe_embed_modules: Sequence,
+) -> torch.Tensor:
+    num_tokens = hashed_inputs[0].numel()
+    if num_tokens == 0:
+        return torch.empty(
+            (0, 4 * 512),
+            device=hashed_inputs[0].device,
+            dtype=oe_embed_modules[0].weight.dtype,
+        )
+
+    output = torch.empty(
+        (num_tokens, 4 * 512),
+        device=hashed_inputs[0].device,
+        dtype=oe_embed_modules[0].weight.dtype,
+    )
+    grid = (num_tokens, triton.cdiv(512, 512))
+    _welm_oe_lookup_concat_prehashed_4x512_kernel[grid](
+        hashed_inputs[0],
+        hashed_inputs[1],
+        hashed_inputs[2],
+        hashed_inputs[3],
+        oe_embed_modules[0].weight,
+        oe_embed_modules[1].weight,
+        oe_embed_modules[2].weight,
+        oe_embed_modules[3].weight,
+        output,
+        num_tokens,
+        oe_embed_modules[0].shard_indices.org_vocab_start_index,
+        oe_embed_modules[1].shard_indices.org_vocab_start_index,
+        oe_embed_modules[2].shard_indices.org_vocab_start_index,
+        oe_embed_modules[3].shard_indices.org_vocab_start_index,
+        oe_embed_modules[0].shard_indices.org_vocab_end_index,
+        oe_embed_modules[1].shard_indices.org_vocab_end_index,
+        oe_embed_modules[2].shard_indices.org_vocab_end_index,
+        oe_embed_modules[3].shard_indices.org_vocab_end_index,
+        hashed_inputs[0].stride(0),
+        hashed_inputs[1].stride(0),
+        hashed_inputs[2].stride(0),
+        hashed_inputs[3].stride(0),
+        oe_embed_modules[0].weight.stride(0),
+        oe_embed_modules[1].weight.stride(0),
+        oe_embed_modules[2].weight.stride(0),
+        oe_embed_modules[3].weight.stride(0),
+        output.stride(0),
+        BLOCK_D=512,
+        EMBED_DIM=512,
+        num_warps=1,
+    )
+    return output

@@ -1,45 +1,41 @@
-# WeLMv4 待优化 Kernel 说明
+# WeLMv4 待优化 Kernel
 
-## 需要支持的算子
+## 未支持的Kernel
 
-### FA4 + Attention Sink
-
-RTX PRO 5000 上普通 FA4 可以运行，但当前 FA4 + Attention Sink
-不支持。
-
-SGLang Triton Attention Sink 在 RTX PRO 5000 上可以运行，但性能
-较差。
+### FA4 与 Attention Sink
+- 当前环境的 FA4 + Attention Sink 不可运行。
+- 不带 Sink 的 FA4 varlen 在 `Q heads=6`、`KV heads=1`、`head_dim=256` shape 下也会编译失败。
+- SGLang Triton Attention Sink 可以运行，但性能较低。
 
 ## 需要优化的 Kernel
 
-带宽型算子对比 1344 GB/s，计算型算子对比 268 BF16 TFLOPS。
+关键单卡 shape：`hidden=2048`、`Q/KV heads=6/1`、`head_dim=256`、
+`RoPE dim=64`、`experts/topk=512/10`、Shared Expert intermediate `128`。
 
-| Kernel | 来源 | 代表 Shape | 延迟 | 当前性能 | 峰值利用率 | 优化原因 |
+| Kernel | 实现/来源 | 代表 Shape | 延迟 | 当前性能 | 峰值利用率 | Benchmark 位置 |
 | --- | --- | --- | ---: | ---: | ---: | --- |
-| **RMSNorm** | WeLM custom | `tokens=512` | 0.0249 ms | 168.5 GB/s | 12.5% | custom kernel 带宽利用率低 |
-| **K RMSNorm** | WeLM custom | `tokens=512` | 0.0332 ms | 15.8 GB/s | 1.2% | 单 KV head 小规模归一化效率低 |
-| **Partial YaRN RoPE** | WeLM custom | `tokens=512` | 0.0216 ms | 176.2 GB/s | 13.1% | partial rotary 数据访问效率低 |
-| **Attention gate projection** | PyTorch BF16 GEMM | `tokens=512` | 0.0248 ms | 86.0 GB/s | 6.4% | `[512,2048] x [2048,6]` 窄 GEMM 效率低 |
-| **Attention gate sigmoid multiply** | WeLM custom | `tokens=512` | 0.0279 ms | 113.1 GB/s | 8.4% | elementwise kernel 带宽利用率低 |
-| **O norm** | WeLM custom | `tokens=512` | 0.0226 ms | 185.7 GB/s | 13.8% | 与 RMSNorm 共用同一个低效 kernel |
-| **Router linear** | WeLM custom | `tokens=512` | 0.0827 ms | 88.7 GB/s | 6.6% | `[512,2048] x [2048,512]` custom matmul 效率低 |
-| **Expert-bias TopK** | WeLM custom | `tokens=512` | 0.0271 ms | 41.0 GB/s | 3.1% | 512 experts、`TopK=10` 选择效率低 |
-| **Shared gate/up projection** | PyTorch BF16 GEMM | `tokens=512` | 0.0307 ms | 69.98 TFLOPS | 26.1% | Shared Expert GEMM 计算利用率低 |
-| **SwiGLU / SiLU-and-Mul** | SGLang open source | `tokens=512` | 0.0262 ms | 60.0 GB/s | 4.5% | elementwise kernel 带宽利用率低 |
-| **Shared down projection** | PyTorch BF16 GEMM | `tokens=512` | 0.0205 ms | 52.43 TFLOPS | 19.6% | Shared Expert GEMM 计算利用率低 |
-| **OE lookup concat** | SGLang open source | `tokens=512` | 0.0278 ms | 151.3 GB/s | 11.3% | 四路 embedding lookup/concat 搬运效率低 |
+| **RMSNorm** | WeLM custom `WelmV4FusedRMSNorm` | `tokens=512` | 0.0235 ms | 179.0 GB/s | 13.3% | `benchmark_welmv4_kernels.py:L280` |
+| **K RMSNorm** | WeLM custom `mmq_style_k_rms_norm` | `tokens=512` | 0.0352 ms | 14.9 GB/s | 1.1% | `benchmark_welmv4_kernels.py:L293` |
+| **Partial YaRN RoPE** | WeLM custom `WelmV4InplaceRotaryEmbedding` | `tokens=512` | 0.0371 ms | 28.3 GB/s | 2.1% | `benchmark_welmv4_kernels.py:L302` |
+| **Attention gate projection** | PyTorch BF16 GEMM | `tokens=512` | 0.0243 ms | 87.7 GB/s | 6.5% | `benchmark_welmv4_kernels.py:L324` |
+| **Attention gate sigmoid multiply** | WeLM custom `inplace_sigmoid_mul` | `tokens=512` | 0.0178 ms | 177.5 GB/s | 13.2% | `benchmark_welmv4_kernels.py:L344` |
+| **Sink prefill local** | SGLang Triton Attention | `sequence=2048, window=512` | 0.5111 ms | 11.05 TFLOPS | 4.1% | `benchmark_welmv4_kernels.py:L164` |
+| **Sink prefill global** | SGLang Triton Attention | `sequence=4096, window=262144` | 3.1503 ms | 16.36 TFLOPS | 6.1% | `benchmark_welmv4_kernels.py:L164` |
+| **O norm** | WeLM custom `WelmV4FusedRMSNorm` | `tokens=512` | 0.0244 ms | 172.1 GB/s | 12.8% | `benchmark_welmv4_kernels.py:L280` |
+| **Router linear** | WeLM custom `mmq_style_router_linear` | `tokens=512` | 0.0583 ms | 197.8 GB/s | 14.7% | `benchmark_welmv4_kernels.py:L357` |
+| **Expert-bias TopK** | WeLM custom `mmq_style_expert_bias_topk` | `tokens=512` | 0.0494 ms | 22.5 GB/s | 1.7% | `benchmark_welmv4_kernels.py:L375` |
+| **Shared gate/up projection** | PyTorch BF16 GEMM | `tokens=512, out=256` | 0.0226 ms | 150.6 GB/s | 11.2% | `benchmark_welmv4_kernels.py:L324` |
+| **SwiGLU / SiLU-and-Mul** | SGLang JIT CUDA | `tokens=512, in/out=256/128` | 0.0358 ms | 11.0 GB/s | 0.8% | `benchmark_welmv4_kernels.py:L389` |
+| **Shared down projection** | PyTorch BF16 GEMM | `tokens=512, in=128` | 0.0158 ms | 173.9 GB/s | 12.9% | `benchmark_welmv4_kernels.py:L324` |
+| **OE lookup concat** | WeLM custom OE kernel | `tokens=512, TP4` | 0.0290 ms | 90.7 GB/s | 6.7% | `benchmark_welmv4_kernels.py:L239` |
 
-`RMSNorm` 和 `O norm` 共用实现，因此 12 类测项对应 6 个独立 WeLM
-custom kernel。其余测项直接调用 PyTorch 或 SGLang 开源实现，未复制其源码。
+14 类测项中有 7 个独立的 WeLM custom kernel；`RMSNorm` 和 `O norm`
+共用实现。其余测项直接调用 PyTorch 或 SGLang 开源实现。
 
 ## 复现
 
 ```bash
-export PYTHONPATH=/path/to/sglang/python
-export WELM_USE_PREVIOUS_PRECISION=0
-cd /path/to/nvidia_welmv4_optimized_kernels_20260724
-
-# 核心待优化项
+# 核心项；默认测试 Triton Attention Sink
 python benchmark_welmv4_kernels.py \
   --strict \
   --report /tmp/welmv4_optimized.json
@@ -51,10 +47,9 @@ python benchmark_welmv4_kernels.py \
   --strict \
   --report /tmp/welmv4_oe.json
 
-# 复现 FA4 + Sink 不支持
+# FA4 + Attention Sink
 python benchmark_welmv4_kernels.py \
   --cases attention_prefill_sink_local,attention_prefill_sink_global \
   --attention-impl fa4 \
   --attention-seq-lens 512 \
   --report /tmp/welmv4_fa4_sink.json
-```

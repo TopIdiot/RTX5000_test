@@ -30,6 +30,7 @@ TP4_KV_HEADS = 1
 NUM_EXPERTS = 512
 TOPK = 10
 SHARED_INTERMEDIATE_SIZE = 512
+TP4_SHARED_INTERMEDIATE_SIZE = SHARED_INTERMEDIATE_SIZE // TP_SIZE
 ROPE_DIM = 64
 MAX_POSITION = 262144
 LOCAL_WINDOW = 512
@@ -72,15 +73,12 @@ class _FakeShard:
     def __init__(self, end: int):
         self.org_vocab_start_index = 0
         self.org_vocab_end_index = end
-        self.num_org_vocab_padding = 0
-        self.num_added_elements_padded = 0
 
 
 class _FakeEmbed:
     def __init__(self, weight: torch.Tensor):
         self.weight = weight
         self.shard_indices = _FakeShard(weight.shape[0])
-        self.quant_method = None
 
 
 _OE_TABLES: list[torch.Tensor] | None = None
@@ -163,11 +161,13 @@ def make_yarn_cache() -> torch.Tensor:
     return cache.to("cuda")
 
 
-def make_sink_prefill(seq: int, window: int, implementation: str) -> Run:
+def make_sink_prefill(
+    seq: int, window: int, implementation: str, use_sink: bool
+) -> Run:
     q = randn((seq, TP4_Q_HEADS, HEAD_DIM))
     k = randn((seq, TP4_KV_HEADS, HEAD_DIM))
     v = randn((seq, TP4_KV_HEADS, HEAD_DIM))
-    sinks = randn((TP4_Q_HEADS,))
+    sinks = randn((TP4_Q_HEADS,)) if use_sink else None
     scale = attention_scale()
 
     if implementation == "triton":
@@ -224,7 +224,9 @@ def make_sink_prefill(seq: int, window: int, implementation: str) -> Run:
     else:
         raise ValueError(f"unsupported attention implementation: {implementation}")
 
-    attended = min(seq, window)
+    # The Triton mask is q_id <= kv_id + window, so the current token plus
+    # `window` preceding tokens are visible.
+    attended = min(seq, window + 1)
     if attended < seq:
         pairs = seq * attended - attended * (attended - 1) / 2
     else:
@@ -234,12 +236,8 @@ def make_sink_prefill(seq: int, window: int, implementation: str) -> Run:
     return Run(fn, flops, float(logical_bytes))
 
 
-def make_oe_lookup(tokens: int) -> Run:
+def make_oe_lookup(tokens: int, ops) -> Run:
     global _OE_TABLES
-
-    from sglang.srt.models.welm_perf_opt import (
-        _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512,
-    )
 
     if _OE_TABLES is None:
         _OE_TABLES = [
@@ -250,22 +248,33 @@ def make_oe_lookup(tokens: int) -> Run:
             )
             for vocab in OE_VOCAB_SIZES
         ]
+    # Hashes are global vocabulary indices. On TP rank 0, approximately one
+    # quarter of them hit the local embedding shard; invalid rows are zeroed.
     hashed = [
-        torch.randint(0, table.shape[0], (tokens,), dtype=torch.int64, device="cuda")
-        for table in _OE_TABLES
+        torch.randint(0, vocab, (tokens,), dtype=torch.int64, device="cuda")
+        for vocab in OE_VOCAB_SIZES
     ]
     modules = [_FakeEmbed(table) for table in _OE_TABLES]
 
     def fn():
-        return _compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
+        return ops._compute_welm_oe_concat_local_partials_prehashed_specialized_4x512(
             hashed_inputs=hashed, oe_embed_modules=modules
         )
 
-    logical_bytes = tokens * 4 * (8 + 4 * OE_DIM)
+    hash_bytes = tokens * len(OE_VOCAB_SIZES) * torch.int64.itemsize
+    output_bytes = tokens * len(OE_VOCAB_SIZES) * OE_DIM * torch.bfloat16.itemsize
+    local_hits = sum(
+        int((ids < table.shape[0]).sum().item())
+        for ids, table in zip(hashed, _OE_TABLES)
+    )
+    embedding_bytes = local_hits * OE_DIM * torch.bfloat16.itemsize
+    logical_bytes = hash_bytes + output_bytes + embedding_bytes
     return Run(fn, 0.0, float(logical_bytes))
 
 
-def make_run(name: str, size: int, implementation: str, ops) -> Run:
+def make_run(
+    name: str, size: int, implementation: str, use_attention_sink: bool, ops
+) -> Run:
     import torch.nn.functional as F
 
     if name in {"rms_norm", "o_norm"}:
@@ -301,12 +310,11 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
         ).cuda()
         module.cos_sin_cache = make_yarn_cache()
         rotated = size * (TP4_Q_HEADS + TP4_KV_HEADS) * ROPE_DIM
-        logical_bytes = (
-            nbytes(positions)
-            + 2 * nbytes(q)
-            + 2 * nbytes(k)
-            + size * ROPE_DIM * 4
-        )
+        # The in-place kernel touches only the final ROPE_DIM values of each
+        # head, not the complete HEAD_DIM-wide Q/K tensors.
+        rotated_tensor_bytes = rotated * torch.bfloat16.itemsize
+        cache_bytes = size * ROPE_DIM * torch.float32.itemsize
+        logical_bytes = nbytes(positions) + 2 * rotated_tensor_bytes + cache_bytes
         return Run(
             lambda: module.forward_cuda(positions, q, k),
             float(rotated * 3),
@@ -317,9 +325,9 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
         "attention_gate_projection": (HIDDEN_SIZE, TP4_Q_HEADS),
         "shared_gate_up_projection": (
             HIDDEN_SIZE,
-            2 * SHARED_INTERMEDIATE_SIZE,
+            2 * TP4_SHARED_INTERMEDIATE_SIZE,
         ),
-        "shared_down_projection": (SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        "shared_down_projection": (TP4_SHARED_INTERMEDIATE_SIZE, HIDDEN_SIZE),
     }
     if name in linear_shapes:
         input_width, output_width = linear_shapes[name]
@@ -344,7 +352,7 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
 
     if name.startswith("attention_prefill_sink_"):
         window = LOCAL_WINDOW if name.endswith("local") else MAX_POSITION
-        return make_sink_prefill(size, window, implementation)
+        return make_sink_prefill(size, window, implementation, use_attention_sink)
 
     if name == "router_linear":
         x = randn((size, HIDDEN_SIZE))
@@ -352,10 +360,16 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
             (NUM_EXPERTS, HIDDEN_SIZE), dtype=torch.float32, scale=0.02
         )
         output_bytes = size * NUM_EXPERTS * torch.float32.itemsize
+        converted_weight_bytes = weight.numel() * torch.bfloat16.itemsize
         return Run(
             lambda: ops.mmq_style_router_linear(x, weight),
             float(2 * size * HIDDEN_SIZE * NUM_EXPERTS),
-            float(nbytes(x) + nbytes(weight) + output_bytes),
+            float(
+                nbytes(x)
+                + nbytes(weight)
+                + 2 * converted_weight_bytes
+                + output_bytes
+            ),
         )
 
     if name == "expert_bias_topk":
@@ -375,9 +389,9 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
     if name == "silu_and_mul":
         from sglang.srt.layers.activation import SiluAndMul
 
-        x = randn((size, 2 * SHARED_INTERMEDIATE_SIZE))
+        x = randn((size, 2 * TP4_SHARED_INTERMEDIATE_SIZE))
         module = SiluAndMul()
-        output_numel = size * SHARED_INTERMEDIATE_SIZE
+        output_numel = size * TP4_SHARED_INTERMEDIATE_SIZE
         output_bytes = output_numel * torch.bfloat16.itemsize
         return Run(
             lambda: module(x),
@@ -386,7 +400,7 @@ def make_run(name: str, size: int, implementation: str, ops) -> Run:
         )
 
     if name == "oe_lookup_concat":
-        return make_oe_lookup(size)
+        return make_oe_lookup(size, ops)
 
     raise KeyError(name)
 
@@ -447,6 +461,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attention-impl", choices=("triton", "fa4", "all"), default="triton"
+    )
+    parser.add_argument(
+        "--attention-sink",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable Attention Sink; --no-attention-sink diagnoses plain FA4",
     )
     parser.add_argument(
         "--include-oe",
@@ -527,7 +547,9 @@ def main() -> int:
             for implementation in implementations:
                 run = None
                 try:
-                    run = make_run(name, size, implementation, ops)
+                    run = make_run(
+                        name, size, implementation, args.attention_sink, ops
+                    )
                     ms = benchmark_once(run.fn, args.warmup, args.repeat)
                     intensity = run.flops / run.logical_bytes if run.logical_bytes else 0.0
                     bound = "compute" if intensity >= ridge else "bandwidth"
@@ -600,6 +622,7 @@ def main() -> int:
             "num_experts": NUM_EXPERTS,
             "topk": TOPK,
             "shared_intermediate_size": SHARED_INTERMEDIATE_SIZE,
+            "tp4_shared_intermediate_size": TP4_SHARED_INTERMEDIATE_SIZE,
             "rope_dim": ROPE_DIM,
         },
         "method": {
@@ -609,6 +632,7 @@ def main() -> int:
             "tokens": args.tokens,
             "attention_seq_lens": args.attention_seq_lens,
             "attention_impl": args.attention_impl,
+            "attention_sink": args.attention_sink,
             "include_oe": args.include_oe,
             "traffic": "logical tensor bytes, not hardware-counter DRAM bytes",
         },
